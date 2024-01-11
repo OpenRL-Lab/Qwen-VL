@@ -2,14 +2,15 @@
 # Implements API for Qwen-7B in OpenAI's format. (https://platform.openai.com/docs/api-reference/chat)
 # Usage: python openai_api.py
 # Visit http://localhost:8000/docs for documents.
-
+import os
 import re
 import copy
 import json
 import time
 from argparse import ArgumentParser
 from contextlib import asynccontextmanager
-from typing import Dict, List, Literal, Optional, Union
+from typing import Dict, List, Literal, Optional, Union, Tuple
+import base64
 
 import torch
 import uvicorn
@@ -19,6 +20,41 @@ from pydantic import BaseModel, Field
 # from sse_starlette.sse import EventSourceResponse
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from transformers.generation import GenerationConfig
+from PIL import Image
+# from io import BytesIO
+import urllib.parse
+# import requests
+import io
+import tempfile
+
+def is_url(string):
+    try:
+        result = urllib.parse.urlparse(string)
+        return all([result.scheme, result.netloc])
+    except:
+        return False
+
+def save_base64_to_local_image(base64_str, save_path, quality=95):
+    # 去掉 base64 数据前的 URL 部分
+    base64_data = base64_str.split(',')[1]
+    # 将 base64 字符串转换为二进制数据
+    img_data = base64.b64decode(base64_data)
+    # 将二进制数据转换为图片对象
+    img = Image.open(io.BytesIO(img_data))
+    # 检查文件扩展名以确定格式
+    if save_path.lower().endswith('.jpg') or save_path.lower().endswith('.jpeg'):
+        img.save(save_path, 'JPEG', quality=quality)
+    else:
+        img.save(save_path)
+
+def convert_single_image_url(image_url: str) -> Tuple[str, Optional[str]]:
+    local_save_path = None
+    if image_url.startswith("data:"):
+        local_save_path = tempfile.NamedTemporaryFile(suffix='.png', delete=False).name
+        save_base64_to_local_image(image_url, save_path=local_save_path)
+        image_url = local_save_path
+
+    return image_url, local_save_path
 
 
 @asynccontextmanager
@@ -55,9 +91,32 @@ class ModelList(BaseModel):
     data: List[ModelCard] = []
 
 
+# class ChatMessage(BaseModel):
+#     role: Literal["user", "assistant", "system", "function"]
+#     content: Optional[str]
+#     function_call: Optional[Dict] = None
+
+
+class ImageUrl(BaseModel):
+    url: str
+
+
+class TextContent(BaseModel):
+    type: Literal["text"]
+    text: str
+
+
+class ImageUrlContent(BaseModel):
+    type: Literal["image_url"]
+    image_url: ImageUrl
+
+
+ContentItem = Union[TextContent, ImageUrlContent]
+
+
 class ChatMessage(BaseModel):
     role: Literal["user", "assistant", "system", "function"]
-    content: Optional[str]
+    content: Union[str, List[ContentItem]]
     function_call: Optional[Dict] = None
 
 
@@ -157,6 +216,7 @@ _TEXT_COMPLETION_CMD = object()
 # TODO: Use real system role when the model is ready.
 #
 def parse_messages(messages, functions):
+    local_image_paths = []
     if all(m.role != "user" for m in messages):
         raise HTTPException(
             status_code=400,
@@ -208,7 +268,7 @@ def parse_messages(messages, functions):
     messages = []
     for m_idx, m in enumerate(_messages):
         role, content, func_call = m.role, m.content, m.function_call
-        if content:
+        if content and isinstance(content, str):  # text
             content = content.lstrip("\n").rstrip()
         if role == "function":
             if (len(messages) == 0) or (messages[-1].role != "assistant"):
@@ -246,7 +306,7 @@ def parse_messages(messages, functions):
                 messages[-1].content += content
         elif role == "user":
             messages.append(
-                ChatMessage(role="user", content=content.lstrip("\n").rstrip())
+                ChatMessage(role="user", content=content.lstrip("\n").rstrip() if content and isinstance(content,str) else content)
             )
         else:
             raise HTTPException(
@@ -255,7 +315,36 @@ def parse_messages(messages, functions):
 
     query = _TEXT_COMPLETION_CMD
     if messages[-1].role == "user":
-        query = messages[-1].content
+        # query = messages[-1].content
+        content = messages[-1].content
+        if isinstance(content, list):  # text
+            text_content = ' '.join(item.text for item in content if isinstance(item, TextContent))
+        else:
+            text_content = content
+        img_dict = None
+
+        if isinstance(content, list):  # image
+            image_list = []
+            for item in content:
+                if isinstance(item, ImageUrlContent):
+                    image_url = item.image_url.url
+                    # print("image_url:", image_url)
+                    if is_url(image_url):
+                        image_list.append(image_url)
+                    elif image_url.startswith("data:"):
+                        image_url, local_save_path = convert_single_image_url(image_url)
+                        image_list.append(image_url)
+                        local_image_paths.append(local_save_path)
+
+
+
+            if image_list:
+                img_dict = {"image":image_list[-1]}
+        if img_dict:
+            query = tokenizer.from_list_format([img_dict, {"text": text_content}])
+        else:
+            query = text_content
+
         messages = messages[:-1]
 
     if len(messages) % 2 != 0:
@@ -272,7 +361,7 @@ def parse_messages(messages, functions):
             for t in dummy_thought.values():
                 t = t.lstrip("\n")
                 if bot_msg.startswith(t) and ("\nAction: " in bot_msg):
-                    bot_msg = bot_msg[len(t) :]
+                    bot_msg = bot_msg[len(t):]
             history.append([usr_msg, bot_msg])
         else:
             raise HTTPException(
@@ -282,7 +371,7 @@ def parse_messages(messages, functions):
     if system:
         assert query is not _TEXT_COMPLETION_CMD
         query = f"{system}\n\nQuestion: {query}"
-    return query, history
+    return query, history, local_image_paths
 
 
 def parse_response(response):
@@ -296,8 +385,8 @@ def parse_response(response):
             # because the output text may have discarded the stop word.
             response = response.rstrip() + "\nObservation:"  # Add it back.
         k = response.rfind("\nObservation:")
-        func_name = response[i + len("\nAction:") : j].strip()
-        func_args = response[j + len("\nAction Input:") : k].strip()
+        func_name = response[i + len("\nAction:"): j].strip()
+        func_args = response[j + len("\nAction Input:"): k].strip()
     if func_name:
         choice_data = ChatCompletionResponseChoice(
             index=0,
@@ -311,7 +400,7 @@ def parse_response(response):
         return choice_data
     z = response.rfind("\nFinal Answer: ")
     if z >= 0:
-        response = response[z + len("\nFinal Answer: ") :]
+        response = response[z + len("\nFinal Answer: "):]
     choice_data = ChatCompletionResponseChoice(
         index=0,
         message=ChatMessage(role="assistant", content=response),
@@ -342,7 +431,7 @@ def text_complete_last_message(history, stop_words_ids):
     output = model.generate(input_ids, stop_words_ids=stop_words_ids).tolist()[0]
     output = tokenizer.decode(output, errors="ignore")
     assert output.startswith(prompt)
-    output = output[len(prompt) :]
+    output = output[len(prompt):]
     output = trim_stop_words(output, ["<|endoftext|>", im_end])
     print(f"<completion>\n{prompt}\n<!-- *** -->\n{output}\n</completion>")
     return output
@@ -358,32 +447,39 @@ async def create_chat_completion(request: ChatCompletionRequest):
         if "Observation:" not in stop_words:
             stop_words.append("Observation:")
 
-    query, history = parse_messages(request.messages, request.functions)
+    query, history, local_image_paths = parse_messages(request.messages, request.functions)
 
-    if request.stream:
-        if request.functions:
-            raise HTTPException(
-                status_code=400,
-                detail="Invalid request: Function calling is not yet implemented for stream mode.",
+    try:
+        if request.stream:
+            if request.functions:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid request: Function calling is not yet implemented for stream mode.",
+                )
+            # generate = predict(query, history, request.model, stop_words)
+            # return EventSourceResponse(generate, media_type="text/event-stream")
+            raise HTTPException(status_code=400, detail="Stream request is not supported currently.")
+
+        stop_words_ids = [tokenizer.encode(s) for s in stop_words] if stop_words else None
+        if query is _TEXT_COMPLETION_CMD:
+            response = text_complete_last_message(history, stop_words_ids=stop_words_ids)
+        else:
+            response, _ = model.chat(
+                tokenizer,
+                query,
+                history=history,
+                stop_words_ids=stop_words_ids,
+                append_history=False,
+                top_p=request.top_p,
+                temperature=request.temperature,
             )
-        # generate = predict(query, history, request.model, stop_words)
-        # return EventSourceResponse(generate, media_type="text/event-stream")
-        raise HTTPException(status_code=400, detail="Stream request is not supported currently.")
+            print(f"<chat>\n{history}\n{query}\n<!-- *** -->\n{response}\n</chat>")
+    except Exception as e:
+        raise e
+    finally:
+        for local_image_path in local_image_paths:
+            os.remove(local_image_path)
 
-    stop_words_ids = [tokenizer.encode(s) for s in stop_words] if stop_words else None
-    if query is _TEXT_COMPLETION_CMD:
-        response = text_complete_last_message(history, stop_words_ids=stop_words_ids)
-    else:
-        response, _ = model.chat(
-            tokenizer,
-            query,
-            history=history,
-            stop_words_ids=stop_words_ids,
-            append_history=False,
-            top_p=request.top_p,
-            temperature=request.temperature,
-        )
-        print(f"<chat>\n{history}\n{query}\n<!-- *** -->\n{response}\n</chat>")
     response = trim_stop_words(response, stop_words)
     if request.functions:
         choice_data = parse_response(response)
@@ -399,7 +495,7 @@ async def create_chat_completion(request: ChatCompletionRequest):
 
 
 async def predict(
-    query: str, history: List[List[str]], model_id: str, stop_words: List[str]
+        query: str, history: List[List[str]], model_id: str, stop_words: List[str]
 ):
     global model, tokenizer
     choice_data = ChatCompletionResponseStreamChoice(
@@ -459,14 +555,14 @@ def _get_args():
         "--cpu-only", action="store_true", help="Run demo with CPU only"
     )
     parser.add_argument(
-        "--server-port", type=int, default=8000, help="Demo server port."
+        "--server-port", type=int, default=64135, help="Demo server port."
     )
     parser.add_argument(
         "--server-name",
         type=str,
-        default="127.0.0.1",
+        default="0.0.0.0",
         help="Demo server name. Default: 127.0.0.1, which is only visible from the local computer."
-        " If you want other computers to access your server, use 0.0.0.0 instead.",
+             " If you want other computers to access your server, use 0.0.0.0 instead.",
     )
 
     args = parser.parse_args()
@@ -492,6 +588,7 @@ if __name__ == "__main__":
         device_map=device_map,
         trust_remote_code=True,
         resume_download=True,
+        fp32=True,
     ).eval()
 
     model.generation_config = GenerationConfig.from_pretrained(
