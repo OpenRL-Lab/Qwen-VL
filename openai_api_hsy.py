@@ -471,7 +471,7 @@ async def create_chat_completion(request: ChatCompletionRequest):
                 stop_words_ids=stop_words_ids,
                 append_history=False,
                 top_p=request.top_p,
-                temperature=request.temperature,
+                temperature=max(request.temperature,1e-3),
             )
             print(f"<chat>\n{history}\n{query}\n<!-- *** -->\n{response}\n</chat>")
     except Exception as e:
